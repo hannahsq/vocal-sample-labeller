@@ -74,6 +74,7 @@ class WindowResult:
     # Core features
     loudness_dbfs: float = float("nan")
     periodicity: float = float("nan")
+    f0_hz: float = float("nan")          # Fundamental frequency (Hz); NaN if unvoiced
     jitter_local: float = float("nan")   # RAP jitter (%)
     shimmer_local: float = float("nan")  # Local shimmer (%)
 
@@ -331,6 +332,7 @@ def analyse_frame(
         frame, sr, cfg.f0_min, cfg.f0_max, cfg.voicing_threshold
     )
     res.periodicity = periodicity
+    res.f0_hz = f0 if f0 is not None else float("nan")
 
     # 3. Jitter & shimmer (voiced frames only)
     if f0 is not None:
@@ -411,7 +413,7 @@ def process_file(
 
 FIELDNAMES = [
     "file", "window_index", "t_center_s", "t_start_s", "t_end_s",
-    "loudness_dbfs", "periodicity", "jitter_local", "shimmer_local",
+    "loudness_dbfs", "periodicity", "f0_hz", "jitter_local", "shimmer_local",
     "F1","B1","F2","B2","F3","B3","F4","B4","F5","B5","F6","B6","F7","B7",
 ]
 
@@ -438,6 +440,7 @@ def print_summary(results: List[WindowResult]):
         return
     loudness  = [r.loudness_dbfs  for r in results if not np.isnan(r.loudness_dbfs)]
     periodic  = [r.periodicity    for r in results if not np.isnan(r.periodicity)]
+    f0_voiced = [r.f0_hz          for r in results if not np.isnan(r.f0_hz)]
     jitter    = [r.jitter_local   for r in results if not np.isnan(r.jitter_local)]
     shimmer   = [r.shimmer_local  for r in results if not np.isnan(r.shimmer_local)]
 
@@ -452,6 +455,13 @@ def print_summary(results: List[WindowResult]):
             print(f"  {name:<22}  (no data)")
     stat("Loudness",    loudness, " dBFS")
     stat("Periodicity", periodic)
+    voiced_pct = 100.0 * len(f0_voiced) / len(results) if results else 0.0
+    if f0_voiced:
+        print(f"  {'F0 (voiced)':<22}  mean={np.mean(f0_voiced):8.1f} Hz  "
+              f"min={np.min(f0_voiced):8.1f} Hz  max={np.max(f0_voiced):8.1f} Hz  "
+              f"({voiced_pct:.1f}% voiced)")
+    else:
+        print(f"  {'F0 (voiced)':<22}  (no voiced frames)")
     stat("Jitter (RAP)", jitter,   " %")
     stat("Shimmer",      shimmer,  " %")
     print(f"{'='*55}\n")

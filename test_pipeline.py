@@ -31,6 +31,8 @@ from pipeline import (
     loudness_dbfs,
     jitter_rap,
     shimmer_local,
+    pitch_and_periodicity,
+    FIELDNAMES,
     process_file,
 )
 
@@ -88,6 +90,20 @@ AM_SHIMMER_TOLERANCE    = 0.90      # ± absolute %
 
 SINE_F1_HZ              = 203.55    # Hz (exact post-quantisation)
 SINE_B1_HZ              = 6.05      # Hz (exact post-quantisation)
+
+# F0 tracking:
+#   200 Hz sine at 16 kHz: lag = sr/f0 = 16000/200 = 80 samples (integer, exact)
+#   Autocorr peak at lag 80 → f0 = 16000/80 = 200.000 Hz (EXACT)
+#   Tolerance of ±1.0 Hz covers integer-lag discretisation (next lag = 79 or 81 samples
+#   → f0 = 202.53 or 197.53 Hz, so ±1.0 Hz is the correct tight bound for 200 Hz).
+#
+#   FM sine (base=200, depth=10): instantaneous freq ∈ [190, 210] Hz.
+#   The autocorr-based detector tracks F0 per window; expected range [190, 210] Hz.
+
+SINE_F0_HZ              = 200.0     # Hz (exact: sr/lag = 16000/80)
+SINE_F0_TOL             = 1.0       # Hz (integer lag discretisation)
+FM_F0_MIN               = 190.0     # Hz (base - depth)
+FM_F0_MAX               = 210.0     # Hz (base + depth)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -622,7 +638,111 @@ class TestFormants(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 6. PIPELINE INTEGRITY
+# 6. F0 TRACKING
+# ---------------------------------------------------------------------------
+
+class TestF0Tracking(unittest.TestCase):
+
+    def test_f0_present_on_voiced_sine(self):
+        """All windows from a 200 Hz sine are voiced → f0_hz is non-NaN everywhere."""
+        path = _write_wav("f0_sine.wav", _sine(200, dur=1.0))
+        vals = [r.f0_hz for r in process_file(path, _cfg())]
+        _check("f0: sine has windows", len(vals) > 0)
+        for v in vals:
+            _check("f0: voiced sine → non-NaN f0_hz", not math.isnan(v), f"got NaN")
+
+    def test_f0_value_matches_sine_frequency(self):
+        """EXACT: 200 Hz sine at 16 kHz → f0_hz = 200.0 Hz ±1.0 Hz per window.
+        Theory: lag = 16000/200 = 80 samples (integer) → f0 = 16000/80 = 200.000 Hz exactly.
+        Tolerance covers ±1 lag discretisation (lags 79/81 → ±2.5 Hz worst case at 200 Hz)."""
+        path = _write_wav("f0_exact.wav", _sine(200, dur=1.0))
+        vals = [r.f0_hz for r in process_file(path, _cfg())
+                if not math.isnan(r.f0_hz)]
+        _check("f0: exact sine has voiced frames", len(vals) > 0)
+        for v in vals:
+            _approx(v, SINE_F0_HZ, tol=SINE_F0_TOL,
+                    name=f"f0: 200 Hz sine → f0_hz = {SINE_F0_HZ} ±{SINE_F0_TOL} Hz")
+
+    def test_f0_nan_for_unvoiced_noise(self):
+        """White noise at voicing_threshold=0.99 → all f0_hz are NaN."""
+        path = _write_wav("f0_noise.wav", _white_noise())
+        vals = [r.f0_hz for r in process_file(path, _cfg(voicing_threshold=0.99))]
+        _check("f0: unvoiced noise → all NaN", _all_nan(vals),
+               f"non-NaN count: {sum(1 for v in vals if not math.isnan(v))}")
+
+    def test_f0_nan_for_silence(self):
+        """Pure silence → all f0_hz are NaN (autocorr of zeros has no valid peak)."""
+        path = _write_wav("f0_silence.wav", _silence())
+        vals = [r.f0_hz for r in process_file(path, _cfg())]
+        _check("f0: silence → all NaN", _all_nan(vals),
+               f"non-NaN count: {sum(1 for v in vals if not math.isnan(v))}")
+
+    def test_f0_tracks_different_frequencies(self):
+        """F0 tracking is monotone: median f0_hz(150 Hz) < median f0_hz(250 Hz)."""
+        cfg = _cfg()
+        med_150 = _median([r.f0_hz for r in
+                           process_file(_write_wav("f0_150.wav", _sine(150, dur=1.0)), cfg)
+                           if not math.isnan(r.f0_hz)])
+        med_250 = _median([r.f0_hz for r in
+                           process_file(_write_wav("f0_250.wav", _sine(250, dur=1.0)), cfg)
+                           if not math.isnan(r.f0_hz)])
+        _check("f0: 150 Hz < 250 Hz (monotonicity)",
+               med_150 < med_250, f"f0_150={med_150:.1f}, f0_250={med_250:.1f}")
+
+    def test_f0_nan_iff_unvoiced(self):
+        """Invariant: f0_hz is NaN if and only if periodicity < voicing_threshold."""
+        cfg = _cfg(voicing_threshold=0.45)
+        for name, sig in [("sine", _sine(200)), ("noise", _white_noise()), ("silence", _silence())]:
+            for r in process_file(_write_wav(f"f0_inv_{name}.wav", sig), cfg):
+                f0_nan = math.isnan(r.f0_hz)
+                unvoiced = r.periodicity < 0.45
+                _check(f"f0 NaN ↔ unvoiced ({name})", f0_nan == unvoiced,
+                       f"f0_hz={'NaN' if f0_nan else r.f0_hz:.1f}, "
+                       f"periodicity={r.periodicity:.3f}")
+
+    def test_f0_unit_function_voiced(self):
+        """Unit: pitch_and_periodicity() returns non-None f0 for a clean 200 Hz sine."""
+        frame = _sine(200, dur=0.025)   # one 25 ms frame
+        f0, periodicity = pitch_and_periodicity(frame, SR, 60, 400, voicing_threshold=0.0)
+        _check("pitch_and_periodicity(): f0 not None for sine", f0 is not None,
+               f"f0={f0}, periodicity={periodicity:.3f}")
+        if f0 is not None:
+            _approx(f0, SINE_F0_HZ, tol=SINE_F0_TOL,
+                    name=f"pitch_and_periodicity(): f0 = {SINE_F0_HZ} ±{SINE_F0_TOL} Hz")
+
+    def test_f0_unit_function_unvoiced(self):
+        """Unit: pitch_and_periodicity() returns None f0 for noise at threshold=0.99."""
+        frame = _white_noise(dur=0.025)
+        f0, _ = pitch_and_periodicity(frame, SR, 60, 400, voicing_threshold=0.99)
+        _check("pitch_and_periodicity(): f0 is None for noise at threshold=0.99",
+               f0 is None, f"got f0={f0}")
+
+    def test_f0_in_fieldnames(self):
+        """f0_hz must appear in FIELDNAMES (CSV column list)."""
+        _check("f0_hz in FIELDNAMES", "f0_hz" in FIELDNAMES,
+               f"FIELDNAMES={FIELDNAMES}")
+
+    def test_f0_is_float_field(self):
+        """f0_hz on WindowResult is always a float or np.floating (never None or int)."""
+        results = process_file(_write_wav("f0_dtype.wav", _sine(200, dur=0.3)), _cfg())
+        for r in results:
+            _check("f0_hz is float/np.floating",
+                   isinstance(r.f0_hz, (float, np.floating)),
+                   f"type={type(r.f0_hz).__name__}")
+
+    def test_f0_within_range_bounds(self):
+        """f0_hz for any voiced frame falls within [f0_min, f0_max] config bounds."""
+        cfg = _cfg(f0_min=60, f0_max=400)
+        results = process_file(_write_wav("f0_bounds.wav", _sine(200, dur=1.0)), cfg)
+        for r in results:
+            if not math.isnan(r.f0_hz):
+                _check("f0_hz within [f0_min, f0_max]",
+                       60.0 <= r.f0_hz <= 400.0,
+                       f"f0_hz={r.f0_hz:.1f}")
+
+
+# ---------------------------------------------------------------------------
+# 7. PIPELINE INTEGRITY
 # ---------------------------------------------------------------------------
 
 class TestPipelineIntegrity(unittest.TestCase):
