@@ -1,78 +1,44 @@
 """
 Hillenbrand Dataset Runner
 ==========================
-Downloads the Hillenbrand (1995) American English vowels dataset from HuggingFace,
-saves each audio sample to a temporary WAV file, runs the labelling pipeline over
-it, and writes the results to a CSV enriched with:
+Downloads the MLSpeech/hillenbrand_vowels dataset from HuggingFace, runs the
+acoustic labelling pipeline over each sample, and writes results to a CSV
+enriched with:
 
-  - speaker  : parsed from the filename  (e.g. "m01ae.wav" → "m01")
-  - vowel    : from the dataset's  vowel  field  (e.g. "ae")
-  - groups   : from the dataset's  groups field  (e.g. "m" / "w" / "b" / "g")
+  - speaker  : derived from 'group' field + per-group row index
+               (e.g. "m01", "w03", "b02", "g07")
+  - vowel    : from the dataset's 'vowel' field  (e.g. "ae")
+  - groups   : from the dataset's 'group' field  (e.g. "m" / "w" / "b" / "g")
+
+The dataset's audio column is a string-encoded Python list of float32 samples
+at 16 kHz — no external audio decoder (torchcodec / soundfile) is needed.
 
 Usage:
-    python run_hillenbrand.py [--output results.csv] [--window 25] [--hop 10]
-                              [--target-sr 16000] [--n-formants 7]
-                              [--dataset-name <hf_repo_id>] [--split train]
-
-The dataset identifier defaults to "speech-trove/hillenbrand" – change it with
---dataset-name if your copy lives elsewhere on the Hub.
+    python run_hillenbrand.py
+    python run_hillenbrand.py --output results.csv --window 25 --hop 10
+    python run_hillenbrand.py --split train --target-sr 16000 --n-formants 7
 """
 
+from __future__ import annotations
+
 import argparse
+import ast
 import csv
 import io
 import logging
-import re
-import struct
 import tempfile
 import wave
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Import the pipeline from the same directory (or adjust sys.path as needed)
-# ---------------------------------------------------------------------------
 from pipeline import PipelineConfig, process_file, FIELDNAMES
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Filename parser
-# ---------------------------------------------------------------------------
-
-# Hillenbrand filenames follow the pattern:  <group><speaker_num><vowel>.wav
-# group:       one letter  – m (men), w (women), b (boys), g (girls)
-# speaker_num: two digits  – 01 … 99
-# vowel:       2–3 chars   – ae, ah, aw, eh, ei, er, ih, iy, oa, oo, uh, uw
-_FNAME_RE = re.compile(
-    r"^(?P<group>[mwbg])(?P<num>\d{2})(?P<vowel>[a-z]{2,3})(?:\.wav)?$",
-    re.IGNORECASE,
-)
-
-def parse_filename(filename: str) -> dict:
-    """
-    Parse a Hillenbrand WAV filename into its components.
-
-    Returns a dict with keys: 'speaker', 'vowel_parsed', 'group_parsed'.
-    Falls back to empty strings on a parse failure so the row is never dropped.
-    """
-    stem = Path(filename).stem  # strip directory and extension
-    m = _FNAME_RE.match(stem)
-    if m:
-        group  = m.group("group").lower()
-        num    = m.group("num")
-        vowel  = m.group("vowel").lower()
-        return {
-            "speaker":      f"{group}{num}",   # e.g. "m01"
-            "vowel_parsed": vowel,              # e.g. "ae"
-            "group_parsed": group,             # e.g. "m"
-        }
-    log.warning(f"Could not parse filename: {filename!r}")
-    return {"speaker": "", "vowel_parsed": "", "group_parsed": ""}
+# The MLSpeech/hillenbrand_vowels audio arrays are already at 16 kHz
+DATASET_SR = 16000
 
 
 # ---------------------------------------------------------------------------
@@ -80,16 +46,41 @@ def parse_filename(filename: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def array_to_wav_bytes(array: np.ndarray, sample_rate: int) -> bytes:
-    """Convert a float32 numpy array (±1) to an in-memory 16-bit mono WAV."""
+    """Convert a float32 numpy array (±1) to in-memory 16-bit mono WAV bytes."""
     pcm = np.clip(array, -1.0, 1.0)
     pcm_int16 = (pcm * 32767).astype(np.int16)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
-        wf.setsampwidth(2)           # 16-bit
+        wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         wf.writeframes(pcm_int16.tobytes())
     return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Speaker ID assignment
+# ---------------------------------------------------------------------------
+
+def make_speaker_assigner() -> callable:
+    """
+    Returns a callable get_speaker(group) that assigns a stable, incrementing
+    two-digit index within each group as new samples are seen, producing IDs
+    like 'm01', 'w03', 'b01', 'g10'.
+
+    The Hillenbrand dataset has no explicit speaker column; each row is one
+    isolated-vowel token recorded by a distinct speaker within a group.
+    Incrementing per group faithfully reconstructs the original numbering
+    (m01–m45, w01–w45, b01–b10, g01–g10) when the dataset is in its natural
+    order.
+    """
+    counters: dict[str, int] = {}
+
+    def get_speaker(group: str) -> str:
+        counters[group] = counters.get(group, 0) + 1
+        return f"{group}{counters[group]:02d}"
+
+    return get_speaker
 
 
 # ---------------------------------------------------------------------------
@@ -101,65 +92,60 @@ def run(
     split: str,
     cfg: PipelineConfig,
     output_path: str,
-):
+) -> None:
     try:
-        from datasets import load_dataset, Audio
+        from datasets import load_dataset
     except ImportError:
         raise SystemExit(
-            "The `datasets` package is required.  Install it with:\n"
-            "  pip install datasets soundfile"
+            "The `datasets` package is required.\n"
+            "Install it with:  pip install datasets"
         )
 
     log.info(f"Loading dataset: {dataset_name!r}  split={split!r}")
-    ds = load_dataset(dataset_name, split=split, trust_remote_code=True)
+    ds = load_dataset(dataset_name, split=split, streaming=False)
+    log.info(f"Dataset loaded — {len(ds)} samples")
 
-    # Cast the audio column so HuggingFace decodes it for us
-    if "audio" in ds.features:
-        ds = ds.cast_column("audio", Audio(decode=True))
-
-    # Build the extended fieldnames: pipeline fields + our three extras
     extra_fields = ["speaker", "vowel", "groups"]
     fieldnames   = extra_fields + FIELDNAMES
+
+    get_speaker = make_speaker_assigner()
 
     n_written = 0
     with open(output_path, "w", newline="") as fout:
         writer = csv.DictWriter(fout, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
 
-        for idx, sample in enumerate(ds):
+        for idx, item in enumerate(ds):
             # ----------------------------------------------------------------
-            # 1.  Extract metadata from the dataset row
+            # 1.  Decode the string-encoded audio array
             # ----------------------------------------------------------------
-            audio_col  = sample.get("audio", {})
-            filename   = audio_col.get("path", "") or sample.get("file_name", "")
-            filename   = Path(filename).name  # keep just the basename
-
-            # Dataset-level labels (fall back gracefully if absent)
-            ds_vowel   = sample.get("vowel",  "")
-            ds_groups  = sample.get("groups", "")
-
-            # Parsed from filename
-            parsed = parse_filename(filename)
-
-            # Prefer the dataset's own vowel/groups fields; use parsed as backup
-            vowel  = ds_vowel  or parsed["vowel_parsed"]
-            groups = ds_groups or parsed["group_parsed"]
-            speaker = parsed["speaker"]
-
-            # ----------------------------------------------------------------
-            # 2.  Write audio to a temporary WAV and run the pipeline
-            # ----------------------------------------------------------------
-            array       = audio_col.get("array")
-            sample_rate = audio_col.get("sampling_rate", 16000)
-
-            if array is None or len(array) == 0:
-                log.warning(f"[{idx}] Empty audio for {filename!r}, skipping.")
+            try:
+                audio = np.array(ast.literal_eval(item["audio"]), dtype=np.float32)
+            except Exception as exc:
+                log.warning(f"[{idx}] Could not decode audio: {exc} — skipping")
                 continue
 
+            if audio.size == 0:
+                log.warning(f"[{idx}] Empty audio — skipping")
+                continue
+
+            # ----------------------------------------------------------------
+            # 2.  Extract metadata
+            #     Note: the dataset uses 'group' (singular), not 'groups'
+            # ----------------------------------------------------------------
+            vowel  = item.get("vowel", "")
+            groups = item.get("group", "")
+            speaker = get_speaker(groups)
+
+            # Synthetic filename used for the pipeline's 'file' column
+            filename = f"{speaker}{vowel}.wav"
+
+            # ----------------------------------------------------------------
+            # 3.  Write audio to a temp WAV, run the pipeline, clean up
+            # ----------------------------------------------------------------
             with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
                 tmp_path = tmp.name
-                tmp.write(array_to_wav_bytes(np.asarray(array, dtype=np.float32),
-                                             sample_rate))
+                tmp.write(array_to_wav_bytes(audio, DATASET_SR))
 
             try:
                 window_results = process_file(tmp_path, cfg)
@@ -171,22 +157,21 @@ def run(
                 continue
 
             # ----------------------------------------------------------------
-            # 3.  Write one row per analysis window
+            # 4.  Write one CSV row per analysis window
             # ----------------------------------------------------------------
             for wr in window_results:
                 row = wr.to_dict()
-                # Overwrite the 'file' key with the original dataset filename
-                row["file"]   = filename
-                row["vowel"]  = vowel
-                row["groups"] = groups
+                row["file"]    = filename
+                row["vowel"]   = vowel
+                row["groups"]  = groups
                 row["speaker"] = speaker
                 writer.writerow(row)
                 n_written += 1
 
-            if (idx + 1) % 50 == 0:
-                log.info(f"  Processed {idx + 1} samples …")
+            if (idx + 1) % 100 == 0:
+                log.info(f"  Processed {idx + 1} / {len(ds)} samples …")
 
-    log.info(f"Done. {n_written} rows written to {output_path!r}")
+    log.info(f"Done — {n_written} rows written to {output_path!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -195,18 +180,18 @@ def run(
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Re-label the Hillenbrand HuggingFace dataset with the "
-                    "acoustic feature pipeline.",
+        description="Re-label MLSpeech/hillenbrand_vowels with the acoustic "
+                    "feature pipeline.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--dataset-name", default="speech-trove/hillenbrand",
+    p.add_argument("--dataset-name", default="MLSpeech/hillenbrand_vowels",
                    help="HuggingFace dataset repository ID")
     p.add_argument("--split",  default="train",
-                   help="Dataset split to process (e.g. 'train', 'all')")
+                   help="Dataset split to process")
     p.add_argument("--output", "-o", default="hillenbrand_labels.csv",
                    help="Output CSV path")
 
-    # Pipeline parameters (mirrors pipeline.py CLI)
+    # Pipeline parameters
     p.add_argument("--target-sr",   type=int,   default=16000)
     p.add_argument("--window",      type=float, default=25.0,
                    help="Analysis window length (ms)")
@@ -221,7 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main():
+def main() -> None:
     args = build_parser().parse_args()
 
     cfg = PipelineConfig(
